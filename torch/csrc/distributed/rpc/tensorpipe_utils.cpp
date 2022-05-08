@@ -163,12 +163,16 @@ std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
     buffers.tensors = cloneSparseTensors(rpcMessage->tensors()).vec();
   }
 
+  int non_meta_idx = 0;
+  int meta_idx = std::count_if(buffers.tensors.begin(), buffers.tensors.end(), [](auto& t) { return !t.is_meta(); });
   torch::jit::Pickler pickler([&](const void* buf, size_t sz) -> size_t {
     buffers.pickle.insert(
         buffers.pickle.end(),
         static_cast<const char*>(buf),
         static_cast<const char*>(buf) + sz);
     return sz;
+  }, nullptr, nullptr, nullptr, [&](const at::Tensor& t) -> std::string {
+    return std::to_string(!t.is_meta() ? non_meta_idx++ : meta_idx++);
   });
   pickler.protocol();
   pickler.pushIValue(buffers.tensors);
@@ -177,9 +181,12 @@ std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
   tpMessage.payloads.push_back(tensorpipe::Message::Payload{
       buffers.pickle.data(), buffers.pickle.size()});
   const std::vector<torch::Tensor>& tensorDataVec = pickler.tensorData();
-  tpMessage.tensors.reserve(tensorDataVec.size());
-  for (const auto i : c10::irange(tensorDataVec.size())) {
-    const torch::Tensor& tensor = tensorDataVec[i];
+  std::vector<torch::Tensor> nonMetaTensorDataVec;
+  std::copy_if(tensorDataVec.begin(), tensorDataVec.end(), std::back_inserter(nonMetaTensorDataVec),
+               [](const torch::Tensor& t) { return !t.is_meta(); });
+  tpMessage.tensors.reserve(nonMetaTensorDataVec.size());
+  for (const auto i : c10::irange(nonMetaTensorDataVec.size())) {
+    const torch::Tensor& tensor = nonMetaTensorDataVec[i];
 
     const TensorpipeDeviceTypeConverter* converter =
         getDeviceTypeConverter(tensor.device().type());
@@ -304,7 +311,7 @@ c10::intrusive_ptr<Message> tensorpipeDeserialize(
       nullptr,
       tensorReadFunc,
       {},
-      /* use_storage_device*/ true);
+      /* use_storage_device*/ false);
 
   auto ival = unpickler.parse_ivalue();
   for (auto&& t : ival.toTensorList()) {
